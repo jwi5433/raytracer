@@ -7,7 +7,7 @@ class Ray:
     def __init__(self, origin, direction):
         self.origin = np.array(origin)
         self.direction = np.array(direction)
-        self.direction = self.direction / np.linalg.norm(self.direction)
+        self.direction = self.direction / np.linalg.norm(direction)
 
 class Sphere:
     def __init__(self, center, radius, color):
@@ -18,7 +18,7 @@ class Sphere:
 class Light:
     def __init__(self, direction, color):
         self.direction = np.array(direction)
-        self.direction = self.direction / np.linalg.norm(self.direction)
+        self.direction = self.direction / np.linalg.norm(direction)
         self.color = np.array(color)
 
 class Scene:
@@ -34,8 +34,24 @@ class Raytracer:
         self.height = 0
         self.eye = np.array([0.0, 0.0, 0.0])
         self.forward = np.array([0.0, 0.0, -1.0])
+        self.target_up = np.array([0.0, 1.0, 0.0])
         self.right = np.array([1.0, 0.0, 0.0])
         self.up = np.array([0.0, 1.0, 0.0])
+        self.exposure = None
+        self.is_fisheye = False
+        self.is_panorama = False
+
+    def update_camera_vectors(self):
+        """Update right and up vectors based on forward and target_up."""
+        # Don't normalize forward - its length affects FOV
+        
+        # r⃗ = normalized(f⃗ × up)
+        self.right = np.cross(self.forward, self.target_up)
+        self.right = self.right / np.linalg.norm(self.right)
+        
+        # u⃗ = normalized(r⃗ × f⃗)
+        self.up = np.cross(self.right, self.forward)
+        self.up = self.up / np.linalg.norm(self.up)
 
     def parse_file(self, filename):
         with open(filename, 'r') as f:
@@ -52,6 +68,23 @@ class Raytracer:
                 self.width = int(parts[1])
                 self.height = int(parts[2])
                 self.output_file = os.path.join('output', parts[3])
+            elif command == 'expose':
+                self.exposure = float(parts[1])
+            elif command == 'eye':
+                self.eye = np.array([float(parts[1]), float(parts[2]), float(parts[3])])
+            elif command == 'forward':
+                self.forward = np.array([float(parts[1]), float(parts[2]), float(parts[3])])
+                self.update_camera_vectors()
+            elif command == 'up':
+                self.target_up = np.array([float(parts[1]), float(parts[2]), float(parts[3])])
+                self.target_up = self.target_up / np.linalg.norm(self.target_up)
+                self.update_camera_vectors()
+            elif command == 'fisheye':
+                self.is_fisheye = True
+                self.is_panorama = False
+            elif command == 'panorama':
+                self.is_panorama = True
+                self.is_fisheye = False
             elif command == 'color':
                 self.scene.current_color = np.array([float(parts[1]), float(parts[2]), float(parts[3])])
             elif command == 'sphere':
@@ -103,7 +136,6 @@ class Raytracer:
         if np.dot(normal, ray.direction) > 0:
             normal = -normal
             
-        # If no lights, return black with full opacity
         if not self.scene.lights:
             return np.array([0.0, 0.0, 0.0, 1.0])
             
@@ -124,6 +156,15 @@ class Raytracer:
         
         return np.append(np.clip(color, 0, 1), 1.0)
 
+    def apply_exposure(self, color):
+        if self.exposure is None:
+            return color
+        
+        rgb = color[:3]
+        alpha = color[3:]
+        exposed = 1.0 - np.exp(-self.exposure * rgb)
+        return np.concatenate([exposed, alpha])
+
     def linear_to_srgb(self, linear):
         rgb = linear[:3]
         alpha = linear[3:]
@@ -132,6 +173,40 @@ class Raytracer:
                        1.055 * np.power(rgb, 1/2.4) - 0.055)
         return np.concatenate([srgb, alpha])
 
+    def get_ray_direction(self, x, y):
+        sx = (2.0 * x - self.width) / max(self.width, self.height)
+        sy = (self.height - 2.0 * y) / max(self.width, self.height)
+    
+        if self.is_fisheye:
+            r2 = sx * sx + sy * sy
+            # Check if point is within the fisheye circle
+            if r2 >= 1:
+                return None
+            
+            # Only compute sqrt for points inside the circle
+            z = np.sqrt(1.0 - r2)
+            direction = z * self.forward + sx * self.right + sy * self.up
+        
+        elif self.is_panorama:
+            # Convert x coordinate to longitude (0 to 2π)
+            longitude = (x / self.width) * 2.0 * np.pi
+            # Convert y coordinate to latitude (-π/2 to π/2)
+            latitude = ((self.height - y) / self.height - 0.5) * np.pi
+        
+            # Convert spherical coordinates to Cartesian
+            x = np.cos(latitude) * np.sin(longitude)
+            y = np.sin(latitude)
+            z = np.cos(latitude) * np.cos(longitude)
+        
+            # Transform direction based on camera orientation
+            direction = (z * self.forward + 
+                        x * self.right + 
+                        y * self.up)
+        else:
+            direction = self.forward + sx * self.right + sy * self.up
+        
+        return direction / np.linalg.norm(direction)
+
     def render(self):
         os.makedirs(os.path.dirname(self.output_file), exist_ok=True)
         
@@ -139,15 +214,18 @@ class Raytracer:
         
         for y in range(self.height):
             for x in range(self.width):
-                sx = (2.0 * x - self.width) / max(self.width, self.height)
-                sy = (self.height - 2.0 * y) / max(self.width, self.height)
+                direction = self.get_ray_direction(x, y)
                 
-                direction = self.forward + sx * self.right + sy * self.up
-                direction = direction / np.linalg.norm(direction)
+                if direction is None:  # Outside fisheye circle
+                    image[y, x] = [0, 0, 0, 0]  # Transparent
+                    continue
+                    
                 ray = Ray(self.eye, direction)
                 
                 color = self.cast_ray(ray)
-                image[y, x] = self.linear_to_srgb(color)
+                color = self.apply_exposure(color)
+                color = self.linear_to_srgb(color)
+                image[y, x] = color
         
         image = (np.clip(image, 0, 1) * 255).astype(np.uint8)
         Image.fromarray(image, 'RGBA').save(self.output_file, 'PNG')
