@@ -18,10 +18,19 @@ class Sphere:
 class Plane:
     def __init__(self, a, b, c, d, color):
         self.normal = np.array([a, b, c])
-        # Normalize the normal vector
         self.normal = self.normal / np.linalg.norm(self.normal)
         self.d = d
         self.color = np.array(color)
+
+class Triangle:
+    def __init__(self, v1, v2, v3, color):
+        self.vertices = [np.array(v1), np.array(v2), np.array(v3)]
+        self.color = np.array(color)
+        # Calculate normal
+        edge1 = self.vertices[1] - self.vertices[0]
+        edge2 = self.vertices[2] - self.vertices[0]
+        self.normal = np.cross(edge1, edge2)
+        self.normal = self.normal / np.linalg.norm(self.normal)
 
 class Light:
     def __init__(self, direction, color):
@@ -32,7 +41,9 @@ class Light:
 class Scene:
     def __init__(self):
         self.spheres = []
-        self.planes = []  # Add planes list
+        self.planes = []
+        self.triangles = []
+        self.vertices = []
         self.lights = []
         self.current_color = np.array([1.0, 1.0, 1.0])
 
@@ -98,6 +109,16 @@ class Raytracer:
             elif command == 'plane':
                 a, b, c, d = [float(p) for p in parts[1:]]
                 self.scene.planes.append(Plane(a, b, c, d, self.scene.current_color.copy()))
+            elif command == 'xyz':
+                x, y, z = [float(p) for p in parts[1:4]]
+                self.scene.vertices.append(np.array([x, y, z]))
+            elif command == 'tri':
+                indices = [int(i) - 1 for i in parts[1:4]]
+                indices = [i if i >= 0 else len(self.scene.vertices) + i for i in indices]
+                v1 = self.scene.vertices[indices[0]]
+                v2 = self.scene.vertices[indices[1]]
+                v3 = self.scene.vertices[indices[2]]
+                self.scene.triangles.append(Triangle(v1, v2, v3, self.scene.current_color.copy()))
             elif command == 'sun':
                 direction = [float(parts[1]), float(parts[2]), float(parts[3])]
                 self.scene.lights.append(Light(direction, self.scene.current_color.copy()))
@@ -121,17 +142,39 @@ class Raytracer:
         return t
 
     def intersect_plane(self, ray, plane):
-        # Compute denominator
         denom = np.dot(plane.normal, ray.direction)
-        
-        # Check if ray is parallel to plane
         if abs(denom) < 1e-6:
             return None
-            
-        # Compute intersection distance
         t = -(np.dot(plane.normal, ray.origin) + plane.d) / denom
+        if t < 0:
+            return None
+        return t
+
+    def intersect_triangle(self, ray, triangle):
+        v0, v1, v2 = triangle.vertices
+        edge1 = v1 - v0
+        edge2 = v2 - v0
+        h = np.cross(ray.direction, edge2)
+        a = np.dot(edge1, h)
         
-        # Check if intersection is behind the ray
+        if abs(a) < 1e-6:
+            return None
+            
+        f = 1.0 / a
+        s = ray.origin - v0
+        u = f * np.dot(s, h)
+        
+        if u < 0.0 or u > 1.0:
+            return None
+            
+        q = np.cross(s, edge1)
+        v = f * np.dot(ray.direction, q)
+        
+        if v < 0.0 or u + v > 1.0:
+            return None
+            
+        t = f * np.dot(edge2, q)
+        
         if t < 0:
             return None
             
@@ -144,7 +187,7 @@ class Raytracer:
     def cast_ray(self, ray):
         closest_t = float('inf')
         hit_object = None
-        is_plane = False
+        object_type = None
         
         # Check sphere intersections
         for sphere in self.scene.spheres:
@@ -152,7 +195,7 @@ class Raytracer:
             if t is not None and t < closest_t:
                 closest_t = t
                 hit_object = sphere
-                is_plane = False
+                object_type = 'sphere'
 
         # Check plane intersections
         for plane in self.scene.planes:
@@ -160,7 +203,15 @@ class Raytracer:
             if t is not None and t < closest_t:
                 closest_t = t
                 hit_object = plane
-                is_plane = True
+                object_type = 'plane'
+
+        # Check triangle intersections
+        for triangle in self.scene.triangles:
+            t = self.intersect_triangle(ray, triangle)
+            if t is not None and t < closest_t:
+                closest_t = t
+                hit_object = triangle
+                object_type = 'triangle'
         
         if hit_object is None:
             return np.array([0.0, 0.0, 0.0, 0.0])
@@ -168,10 +219,12 @@ class Raytracer:
         hit_point = ray.origin + closest_t * ray.direction
         
         # Get normal based on object type
-        if is_plane:
-            normal = hit_object.normal
-        else:
+        if object_type == 'sphere':
             normal = self.get_sphere_normal(hit_point, hit_object)
+        elif object_type == 'plane':
+            normal = hit_object.normal
+        else:  # triangle
+            normal = hit_object.normal
         
         if np.dot(normal, ray.direction) > 0:
             normal = -normal
@@ -184,18 +237,23 @@ class Raytracer:
             shadow_ray = Ray(hit_point + normal * 0.001, light.direction)
             in_shadow = False
             
-            # Check shadow intersections with spheres
+            # Check sphere shadows
             for sphere in self.scene.spheres:
-                t = self.intersect_sphere(shadow_ray, sphere)
-                if t is not None:
+                if self.intersect_sphere(shadow_ray, sphere) is not None:
                     in_shadow = True
                     break
-
-            # Check shadow intersections with planes
+                    
+            # Check plane shadows
             if not in_shadow:
                 for plane in self.scene.planes:
-                    t = self.intersect_plane(shadow_ray, plane)
-                    if t is not None:
+                    if self.intersect_plane(shadow_ray, plane) is not None:
+                        in_shadow = True
+                        break
+                        
+            # Check triangle shadows
+            if not in_shadow:
+                for triangle in self.scene.triangles:
+                    if self.intersect_triangle(shadow_ray, triangle) is not None:
                         in_shadow = True
                         break
             
