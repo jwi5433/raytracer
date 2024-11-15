@@ -15,6 +15,14 @@ class Sphere:
         self.radius = radius
         self.color = np.array(color)
 
+class Plane:
+    def __init__(self, a, b, c, d, color):
+        self.normal = np.array([a, b, c])
+        # Normalize the normal vector
+        self.normal = self.normal / np.linalg.norm(self.normal)
+        self.d = d
+        self.color = np.array(color)
+
 class Light:
     def __init__(self, direction, color):
         self.direction = np.array(direction)
@@ -24,6 +32,7 @@ class Light:
 class Scene:
     def __init__(self):
         self.spheres = []
+        self.planes = []  # Add planes list
         self.lights = []
         self.current_color = np.array([1.0, 1.0, 1.0])
 
@@ -43,13 +52,8 @@ class Raytracer:
 
     def update_camera_vectors(self):
         """Update right and up vectors based on forward and target_up."""
-        # Don't normalize forward - its length affects FOV
-        
-        # r⃗ = normalized(f⃗ × up)
         self.right = np.cross(self.forward, self.target_up)
         self.right = self.right / np.linalg.norm(self.right)
-        
-        # u⃗ = normalized(r⃗ × f⃗)
         self.up = np.cross(self.right, self.forward)
         self.up = self.up / np.linalg.norm(self.up)
 
@@ -91,6 +95,9 @@ class Raytracer:
                 center = [float(parts[1]), float(parts[2]), float(parts[3])]
                 radius = float(parts[4])
                 self.scene.spheres.append(Sphere(center, radius, self.scene.current_color.copy()))
+            elif command == 'plane':
+                a, b, c, d = [float(p) for p in parts[1:]]
+                self.scene.planes.append(Plane(a, b, c, d, self.scene.current_color.copy()))
             elif command == 'sun':
                 direction = [float(parts[1]), float(parts[2]), float(parts[3])]
                 self.scene.lights.append(Light(direction, self.scene.current_color.copy()))
@@ -113,25 +120,58 @@ class Raytracer:
             
         return t
 
+    def intersect_plane(self, ray, plane):
+        # Compute denominator
+        denom = np.dot(plane.normal, ray.direction)
+        
+        # Check if ray is parallel to plane
+        if abs(denom) < 1e-6:
+            return None
+            
+        # Compute intersection distance
+        t = -(np.dot(plane.normal, ray.origin) + plane.d) / denom
+        
+        # Check if intersection is behind the ray
+        if t < 0:
+            return None
+            
+        return t
+
     def get_sphere_normal(self, point, sphere):
         normal = point - sphere.center
         return normal / np.linalg.norm(normal)
 
     def cast_ray(self, ray):
         closest_t = float('inf')
-        hit_sphere = None
+        hit_object = None
+        is_plane = False
         
+        # Check sphere intersections
         for sphere in self.scene.spheres:
             t = self.intersect_sphere(ray, sphere)
             if t is not None and t < closest_t:
                 closest_t = t
-                hit_sphere = sphere
+                hit_object = sphere
+                is_plane = False
+
+        # Check plane intersections
+        for plane in self.scene.planes:
+            t = self.intersect_plane(ray, plane)
+            if t is not None and t < closest_t:
+                closest_t = t
+                hit_object = plane
+                is_plane = True
         
-        if hit_sphere is None:
+        if hit_object is None:
             return np.array([0.0, 0.0, 0.0, 0.0])
             
         hit_point = ray.origin + closest_t * ray.direction
-        normal = self.get_sphere_normal(hit_point, hit_sphere)
+        
+        # Get normal based on object type
+        if is_plane:
+            normal = hit_object.normal
+        else:
+            normal = self.get_sphere_normal(hit_point, hit_object)
         
         if np.dot(normal, ray.direction) > 0:
             normal = -normal
@@ -144,15 +184,24 @@ class Raytracer:
             shadow_ray = Ray(hit_point + normal * 0.001, light.direction)
             in_shadow = False
             
+            # Check shadow intersections with spheres
             for sphere in self.scene.spheres:
                 t = self.intersect_sphere(shadow_ray, sphere)
                 if t is not None:
                     in_shadow = True
                     break
+
+            # Check shadow intersections with planes
+            if not in_shadow:
+                for plane in self.scene.planes:
+                    t = self.intersect_plane(shadow_ray, plane)
+                    if t is not None:
+                        in_shadow = True
+                        break
             
             if not in_shadow:
                 diffuse = max(0, np.dot(normal, light.direction))
-                color += hit_sphere.color * light.color * diffuse
+                color += hit_object.color * light.color * diffuse
         
         return np.append(np.clip(color, 0, 1), 1.0)
 
@@ -176,35 +225,27 @@ class Raytracer:
     def get_ray_direction(self, x, y):
         sx = (2.0 * x - self.width) / max(self.width, self.height)
         sy = (self.height - 2.0 * y) / max(self.width, self.height)
-    
+        
         if self.is_fisheye:
             r2 = sx * sx + sy * sy
-            # Check if point is within the fisheye circle
             if r2 >= 1:
                 return None
-            
-            # Only compute sqrt for points inside the circle
             z = np.sqrt(1.0 - r2)
             direction = z * self.forward + sx * self.right + sy * self.up
-        
         elif self.is_panorama:
-            # Convert x coordinate to longitude (0 to 2π)
             longitude = (x / self.width) * 2.0 * np.pi
-            # Convert y coordinate to latitude (-π/2 to π/2)
             latitude = ((self.height - y) / self.height - 0.5) * np.pi
-        
-            # Convert spherical coordinates to Cartesian
+            
             x = np.cos(latitude) * np.sin(longitude)
             y = np.sin(latitude)
             z = np.cos(latitude) * np.cos(longitude)
-        
-            # Transform direction based on camera orientation
+            
             direction = (z * self.forward + 
-                        x * self.right + 
-                        y * self.up)
+                       x * self.right + 
+                       y * self.up)
         else:
             direction = self.forward + sx * self.right + sy * self.up
-        
+            
         return direction / np.linalg.norm(direction)
 
     def render(self):
@@ -216,8 +257,8 @@ class Raytracer:
             for x in range(self.width):
                 direction = self.get_ray_direction(x, y)
                 
-                if direction is None:  # Outside fisheye circle
-                    image[y, x] = [0, 0, 0, 0]  # Transparent
+                if direction is None:
+                    image[y, x] = [0, 0, 0, 0]
                     continue
                     
                 ray = Ray(self.eye, direction)
